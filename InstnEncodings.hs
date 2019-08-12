@@ -1,10 +1,10 @@
-module LMS_Opcodes (instn_lookup) where
+module InstnEncodings (instn_lookup, opcode_map) where
 
 import Data.Map (fromList, lookup, Map)
 import Data.Word
 
 instn_lookup :: String -> Word8
-instn_lookup s = from_maybe (lookup s opcode_map)
+instn_lookup s = from_maybe (Data.Map.lookup s opcode_map)
                  where from_maybe (Just val) = val
                        from_maybe  Nothing   = error $ "This instruction is not found: " ++ s
 
