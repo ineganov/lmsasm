@@ -1,7 +1,10 @@
 import System.Environment
 import Data.Char
+import Data.Word
+import Data.Bits (rotateR, (.&.), (.|.))
 import Data.Map (fromList, member, (!))
-import Control.Monad.State.Lazy (State, get, put, runState, evalState)
+import Control.Monad.State.Lazy (State, get, put, runState, evalState, execState)
+import qualified Data.ByteString as BS
 import InstnEncodings
 
 data Token = Comment  String |
@@ -18,11 +21,29 @@ data Token = Comment  String |
 data Statement = ConstDecl String Int | 
                  VarDecl   String Int | 
                  LabelDecl String     |
-                 Operation String [Token] deriving (Show)
+                 Operation String [OpParam] deriving (Show)
 
-data Function = Function String [Statement] deriving (Show)
+data OpParam = Para_Lit_I Int    |
+               Para_Lit_S String |
+               Para_Ident String |
+               Para_Label String deriving (Show)
+
+data Function = Function {fname :: String, fcode :: [Statement]} deriving (Show)
 
 data ObjectFile = ObjectFile [Statement] [Function] deriving (Show)
+
+type SymMapping = (String, Int)
+type Xltd_Inst  = (Int, String, [Word8])
+data TranslationState = TranslationState { consts  :: [SymMapping],
+                                           globals :: [SymMapping],
+                                           locals  :: [SymMapping],
+                                           labels  :: [SymMapping],
+                                           instns  :: [Xltd_Inst],
+                                           go      :: Int, -- next global variable offset
+                                           lo      :: Int, -- next local variable offset
+                                           pc      :: Int } deriving (Show)
+
+init_xlat_state = TranslationState [] [] [] [] [] 0 0 0
 
 keyw_map = fromList [ ("function", KFunction ),
                       ("const",    KConst    ),
@@ -73,13 +94,13 @@ take_int = do (x:rest) <- get
                  (Lit_I i) -> put rest >> return i
                  otherwise -> error $ "Expected integer literal, but got: " ++ show x
 
-take_prm :: State [Token] Token
+take_prm :: State [Token] OpParam
 take_prm = do (x:rest) <- get
               case x of
-                 (Lit_I i) -> put rest >> return (Lit_I i)
-                 (Lit_S i) -> put rest >> return (Lit_S i)
-                 (Ident i) -> put rest >> return (Ident i)
-                 (Label i) -> put rest >> return (Label i)
+                 (Lit_I i) -> put rest >> return (Para_Lit_I i)
+                 (Lit_S i) -> put rest >> return (Para_Lit_S i)
+                 (Ident i) -> put rest >> return (Para_Ident i)
+                 (Label i) -> put rest >> return (Para_Label i)
                  otherwise -> error $ "Expected integer, identifier, string or a label, but got: " ++ show x
 
 take_idn :: State [Token] String
@@ -123,7 +144,7 @@ parse_globals acc = do (nxt:rest) <- get
                              is_decl_start  KWord    = True                            
                              is_decl_start _         = False
 
-parse_params :: [Token] -> State [Token] [Token]
+parse_params :: [OpParam] -> State [Token] [OpParam]
 parse_params acc = do p          <- take_prm
                       (nxt:rest) <- get
                       if nxt == Comma then put rest >> parse_params (acc ++ [p])
@@ -149,5 +170,167 @@ parse_file = do g <- parse_globals []
                 expect EOF
                 return $ ObjectFile g f
 
+parse_file_io :: FilePath -> IO ObjectFile
+parse_file_io s = do f <- readFile s
+                     let tk = no_comments $ tokenize f
+                     return $ evalState parse_file tk
+
+-----------------------------------------------------------------------------------------------------------------------
+
+integer_enc_size :: Int -> Int
+integer_enc_size i | (i <    32) && (i >    -33) = 1
+                   | (i <   128) && (i >   -129) = 2
+                   | (i < 32768) && (i > -32769) = 3
+                   | otherwise                   = 5
+
+integer_enc_1 :: Int -> [Word8]
+integer_enc_1 x = [fromIntegral x]
+
+integer_enc_2 :: Int -> [Word8]
+integer_enc_2 x = [0x81, fromIntegral x]
+
+integer_enc_3 :: Int -> [Word8]
+integer_enc_3 x = [0x82, getByte 0 w32, getByte 1 w32]
+                  where w32         = (fromIntegral x) :: Word32
+                        getByte i v = fromIntegral $ rotateR v (8*i)
+
+integer_enc_5 :: Int -> [Word8]
+integer_enc_5 x = [0x83, getByte 0 w32, getByte 1 w32, getByte 2 w32, getByte 3 w32]
+                  where w32         = (fromIntegral x) :: Word32
+                        getByte i v = fromIntegral $ rotateR v (8*i)
+
+integer_enc :: Int -> [Word8]
+integer_enc x = case (integer_enc_size x) of
+                     1 -> integer_enc_1 x
+                     2 -> integer_enc_2 x
+                     3 -> integer_enc_3 x
+                     5 -> integer_enc_5 x
+                     otherwise -> error "Encoding size specced incorrectly"
+
+string_enc :: String -> [Word8]
+string_enc s = [0x80] ++ (map (fromIntegral . fromEnum) s) ++ [0x00]
+
+
+op_size :: Statement -> State TranslationState Int
+op_size (ConstDecl _ _ )     = return 0
+op_size (VarDecl   _ _ )     = return 0
+op_size (LabelDecl _ )       = return 0
+op_size (Operation _ params) = (mapM param_size params) >>= (\pm -> return $ sum pm + 1)
+
+
+param_size :: OpParam -> State TranslationState Int
+param_size (Para_Lit_I i) = return (integer_enc_size i)
+param_size (Para_Lit_S s) = return $ length s + 2
+param_size (Para_Label s) = return 3
+
+param_size (Para_Ident s) = do st <- get
+                               let m_l = lookup s (locals  st)
+                               let m_g = lookup s (globals st)
+                               let m_c = lookup s (consts  st)
+                               case (m_l, m_g, m_c) of
+                                 ((Just l), _, _) -> return $ integer_enc_size l
+                                 (_, (Just g), _) -> return $ integer_enc_size g
+                                 (_, _, (Just c)) -> return $ integer_enc_size c
+                                 otherwise        -> error  $ "Undeclared identifier: " ++ s
+
+param_enc :: Int -> OpParam -> State TranslationState [Word8]
+param_enc _ (Para_Lit_I i) = return $ integer_enc i
+param_enc _ (Para_Lit_S s) = return $ string_enc s
+param_enc w (Para_Label s) = get >>= (\st -> case (lookup s $ labels st) of
+                                               Just v  -> return $ integer_enc_3 $ v - ((pc st) + w) -- ref to next pc
+                                               Nothing -> error  $ "Label not declared: " ++ s)
+
+param_enc _ (Para_Ident s) = do st <- get
+                                case lookup s $ consts st of
+                                   Just c  -> return $ integer_enc c
+                                   Nothing -> case lookup s $ locals st of
+                                                 Just l  -> return $ set_head 0x40 $ integer_enc l
+                                                 Nothing -> case lookup s $ globals st of 
+                                                              Just g  -> return $ set_head 0x60 $ integer_enc g
+                                                              Nothing -> error $ "Unknown identifier: " ++ s
+                             where set_head bits (x:rest) = (bits .|. x):rest
+
+
+reset_pc :: State TranslationState ()
+reset_pc = get >>= (\st -> put st{pc = 0})
+
+xlate_globals :: [Statement] -> State TranslationState ()
+
+xlate_globals []                     = return ()
+
+xlate_globals ((LabelDecl s):_)      = error $ "Labels are not allowed in global space: " ++ s
+
+xlate_globals ((Operation s pp):_)   = error $ "Instructions are not allowed in global space: " ++ show (Operation s pp)
+
+xlate_globals ((ConstDecl s i):rest) = do st <- get
+                                          put st{consts = (s,i):consts st}
+                                          xlate_globals rest 
+
+xlate_globals ((VarDecl s i):rest)   = do st <- get
+                                          put st{globals = (s, go st):globals st, go = (go st) + i}
+                                          xlate_globals rest 
+
+
+xlate_func_fst :: [Statement] -> State TranslationState ()
+
+xlate_func_fst []                      = return ()
+
+xlate_func_fst ((LabelDecl s):rest)    = do st <- get
+                                            put st{labels = (s, pc st):labels st}
+                                            xlate_func_fst rest
+
+xlate_func_fst ((Operation s pp):rest) = do st <- get -- only increment pc on the first pass
+                                            par_sizes <- mapM param_size pp
+                                            put st{pc = (pc st) + (sum par_sizes) + 1}
+                                            xlate_func_fst rest
+
+xlate_func_fst ((ConstDecl s i):rest)  = do st <- get
+                                            put st{consts = (s,i):consts st}
+                                            xlate_func_fst rest 
+
+xlate_func_fst ((VarDecl s i):rest)    = do st <- get
+                                            put st{locals = (s, lo st):locals st, lo = (lo st) + i}
+                                            xlate_func_fst rest
+
+
+xlate_func_snd :: [Statement] -> State TranslationState ()
+xlate_func_snd []                      = return ()
+xlate_func_snd ((LabelDecl _):rest)    = xlate_func_snd rest
+xlate_func_snd ((ConstDecl _ _):rest)  = xlate_func_snd rest
+xlate_func_snd ((VarDecl _ _):rest)    = xlate_func_snd rest
+xlate_func_snd ((Operation s pp):rest) = do st <- get
+                                            par_sizes <- mapM param_size pp
+                                            par_encs  <- mapM (param_enc (sum par_sizes + 1)) pp
+                                            let new_inst = (pc st, s, [instn_lookup s] ++ concat par_encs)
+                                            put st{instns = new_inst:instns st, pc = (pc st) + (sum par_sizes) + 1}
+                                            xlate_func_snd rest
+
+xlate_function :: ObjectFile -> State TranslationState ()
+xlate_function (ObjectFile globs (f:_)) = xlate_globals globs >> xlate_func_fst (fcode f) >> reset_pc >> xlate_func_snd (fcode f)
+
+-----------------------------------------------------------------------------------------------------------------------
+
+serialize_xlt :: TranslationState -> [Word8]
+serialize_xlt st = let img_signature = [0x4c, 0x45, 0x47, 0x4f]
+                       version_info  = [0x68, 0x00]
+                       num_objects   = [0x01, 0x00]
+                       glob_bytes    = tail $ integer_enc_5 (4 + (snd $ head $ globals st))
+                       serial_code   = concat $ map (\(_, _, x) -> x) $ reverse $ instns st 
+                       image_size    = tail $ integer_enc_5 (16 + 12 + (length serial_code))
+                       offst_to_inst = tail $ integer_enc_5 (16 + 12)
+                       zeroes        = [0, 0, 0, 0]
+                       loc_bytes     = tail $ integer_enc_5 (4 + (snd $ head $ locals st))
+                   in  img_signature ++ image_size ++ version_info ++ num_objects ++ glob_bytes ++ 
+                       offst_to_inst ++ zeroes ++ loc_bytes ++ 
+                       serial_code
+
+write_rbf :: FilePath -> [Word8] -> IO ()
+write_rbf fname code = BS.writeFile fname $ BS.pack $ code
+
+-----------------------------------------------------------------------------------------------------------------------
+
 main :: IO ()
-main = getArgs >>= readFile . head >>= return . no_comments. tokenize >>= mapM_ (putStrLn . show)
+main = do fname  <- fmap head getArgs
+          parsed <- parse_file_io fname
+          let xlt = execState  (xlate_function parsed) init_xlat_state
+          write_rbf (fname ++ ".rbf") (serialize_xlt xlt)
