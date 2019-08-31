@@ -3,6 +3,7 @@ import Data.Char
 import Data.Word
 import Data.Bits (rotateR, (.&.), (.|.))
 import Data.Map (fromList, member, (!))
+import System.FilePath (replaceExtension)
 import Control.Monad.State.Lazy (State, get, put, runState, evalState, execState)
 import qualified Data.ByteString as BS
 import InstnEncodings
@@ -333,4 +334,4 @@ main :: IO ()
 main = do fname  <- fmap head getArgs
           parsed <- parse_file_io fname
           let xlt = execState  (xlate_function parsed) init_xlat_state
-          write_rbf (fname ++ ".rbf") (serialize_xlt xlt)
+          write_rbf (replaceExtension fname ".rbf") (serialize_xlt xlt)
