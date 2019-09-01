@@ -121,6 +121,7 @@ parse_statement = do (tkn:scnd:rest) <- get
                         (KByte,  (Ident i)) -> put rest  >> expect Semi  >> return (VarDecl i 1)
                         (KHalf,  (Ident i)) -> put rest  >> expect Semi  >> return (VarDecl i 2)
                         (KWord,  (Ident i)) -> put rest  >> expect Semi  >> return (VarDecl i 4)
+                        ((Instn i),  Semi ) -> consume 2 >> return (Operation i [])
                         ((Instn i),      _) -> consume 1 >> parse_params [] >>= (\l -> return (Operation i l))
 
 parse_statements :: [Statement] -> State [Token] [Statement]
@@ -315,15 +316,17 @@ serialize_xlt :: TranslationState -> [Word8]
 serialize_xlt st = let img_signature = [0x4c, 0x45, 0x47, 0x4f]
                        version_info  = [0x68, 0x00]
                        num_objects   = [0x01, 0x00]
-                       glob_bytes    = tail $ integer_enc_5 (4 + (snd $ head $ globals st))
+                       glob_bytes    = varblock_size $ globals st
                        serial_code   = concat $ map (\(_, _, x) -> x) $ reverse $ instns st 
                        image_size    = tail $ integer_enc_5 (16 + 12 + (length serial_code))
                        offst_to_inst = tail $ integer_enc_5 (16 + 12)
                        zeroes        = [0, 0, 0, 0]
-                       loc_bytes     = tail $ integer_enc_5 (4 + (snd $ head $ locals st))
+                       loc_bytes     = varblock_size $ locals st
                    in  img_signature ++ image_size ++ version_info ++ num_objects ++ glob_bytes ++ 
                        offst_to_inst ++ zeroes ++ loc_bytes ++ 
                        serial_code
+                   where varblock_size []    = [0, 0, 0, 0]
+                         varblock_size (x:_) = tail $ integer_enc_5 $ snd x + 4
 
 write_rbf :: FilePath -> [Word8] -> IO ()
 write_rbf fname code = BS.writeFile fname $ BS.pack $ code
