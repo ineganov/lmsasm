@@ -16,11 +16,11 @@ data Token = Comment  String |
              Lit_I    Int    |
              LParen | RParen |
              LBrace | RBrace |
-             KFunction | KConst | KWord | KHalf | KByte | 
+             KFunction | KConst | KWord | KHalf | KByte | KString |
              Comma | Semi | Colon | Equal | EOF deriving (Show, Eq);
 
-data Statement = ConstDecl String Int | 
-                 VarDecl   String Int | 
+data Statement = ConstDecl String Int |
+                 VarDecl   String Int |
                  LabelDecl String     |
                  Operation String [OpParam] deriving (Show)
 
@@ -39,18 +39,20 @@ data TranslationState = TranslationState { consts  :: [SymMapping],
                                            globals :: [SymMapping],
                                            locals  :: [SymMapping],
                                            labels  :: [SymMapping],
+                                           fnlist  :: [SymMapping],
                                            instns  :: [Xltd_Inst],
                                            go      :: Int, -- next global variable offset
                                            lo      :: Int, -- next local variable offset
                                            pc      :: Int } deriving (Show)
 
-init_xlat_state = TranslationState [] [] [] [] [] 0 0 0
+init_xlat_state = TranslationState [] [] [] [] [] [] 0 0 0
 
 keyw_map = fromList [ ("function", KFunction ),
                       ("const",    KConst    ),
                       ("word",     KWord     ),
                       ("half",     KHalf     ),
-                      ("byte",     KByte     ) ]
+                      ("byte",     KByte     ),
+                      ("string",   KString   ) ]
 
 isIdentAlpha :: Char -> Bool
 isIdentAlpha c = (isAlphaNum c) || (c == '_') 
@@ -121,6 +123,7 @@ parse_statement = do (tkn:scnd:rest) <- get
                         (KByte,  (Ident i)) -> put rest  >> expect Semi  >> return (VarDecl i 1)
                         (KHalf,  (Ident i)) -> put rest  >> expect Semi  >> return (VarDecl i 2)
                         (KWord,  (Ident i)) -> put rest  >> expect Semi  >> return (VarDecl i 4)
+                        (KString,(Ident i)) -> put rest  >> expect Colon >> take_int >>= (\d -> expect Semi >> return (VarDecl i d))
                         ((Instn i),  Semi ) -> consume 2 >> return (Operation i [])
                         ((Instn i),      _) -> consume 1 >> parse_params [] >>= (\l -> return (Operation i l))
 
@@ -132,6 +135,7 @@ parse_statements acc = do (nxt:rest) <- get
                                 is_stmt_start  KByte    = True
                                 is_stmt_start  KHalf    = True
                                 is_stmt_start  KWord    = True
+                                is_stmt_start  KString  = True
                                 is_stmt_start (Instn _) = True
                                 is_stmt_start (Ident _) = True                                
                                 is_stmt_start _         = False
@@ -143,7 +147,8 @@ parse_globals acc = do (nxt:rest) <- get
                        where is_decl_start  KConst   = True
                              is_decl_start  KByte    = True
                              is_decl_start  KHalf    = True
-                             is_decl_start  KWord    = True                            
+                             is_decl_start  KWord    = True
+                             is_decl_start  KString  = True
                              is_decl_start _         = False
 
 parse_params :: [OpParam] -> State [Token] [OpParam]
@@ -272,6 +277,10 @@ xlate_globals ((VarDecl s i):rest)   = do st <- get
                                           put st{globals = (s, go st):globals st, go = (go st) + i}
                                           xlate_globals rest 
 
+xlate_flist :: [Function] -> State TranslationState ()
+xlate_flist ff = do st <- get
+                    put st{fnlist = zip (map fname ff) [0..]}
+                    return ()
 
 xlate_func_fst :: [Statement] -> State TranslationState ()
 
@@ -308,7 +317,7 @@ xlate_func_snd ((Operation s pp):rest) = do st <- get
                                             xlate_func_snd rest
 
 xlate_function :: ObjectFile -> State TranslationState ()
-xlate_function (ObjectFile globs (f:_)) = xlate_globals globs >> xlate_func_fst (fcode f) >> reset_pc >> xlate_func_snd (fcode f)
+xlate_function (ObjectFile globs fns) = xlate_globals globs >> xlate_flist fns >> xlate_func_fst (fcode $ head fns) >> reset_pc >> xlate_func_snd (fcode $ head fns)
 
 -----------------------------------------------------------------------------------------------------------------------
 
