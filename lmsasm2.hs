@@ -29,23 +29,44 @@ data OpParam = Para_Lit_I Int    |
                Para_Ident String |
                Para_Label String deriving (Show)
 
+data Symbol = SymConst   String Int     |
+              SymGlobVar String Int Int |
+              SymLocVar  String Int Int |
+              SymLabel   String Int     |
+              SymFunName String Int deriving (Show)
+
 data Function = Function {fname :: String, fcode :: [Statement]} deriving (Show)
 
 data ObjectFile = ObjectFile [Statement] [Function] deriving (Show)
 
 type SymMapping = (String, Int)
 type Xltd_Inst  = (Int, String, [Word8])
-data TranslationState = TranslationState { consts  :: [SymMapping],
-                                           globals :: [SymMapping],
-                                           locals  :: [SymMapping],
-                                           labels  :: [SymMapping],
-                                           fnlist  :: [SymMapping],
+data TranslationState = TranslationState { syms    :: [Symbol],
                                            instns  :: [Xltd_Inst],
                                            go      :: Int, -- next global variable offset
                                            lo      :: Int, -- next local variable offset
                                            pc      :: Int } deriving (Show)
 
-init_xlat_state = TranslationState [] [] [] [] [] [] 0 0 0
+lookup_sym :: [Symbol] -> String -> Maybe Symbol
+lookup_sym [] _                          = Nothing
+lookup_sym ((SymConst   nm i):rest)    s = if nm == s then Just $ SymConst   nm i    else lookup_sym rest s
+lookup_sym ((SymGlobVar nm i sz):rest) s = if nm == s then Just $ SymGlobVar nm i sz else lookup_sym rest s
+lookup_sym ((SymLocVar  nm i sz):rest) s = if nm == s then Just $ SymLocVar  nm i sz else lookup_sym rest s
+lookup_sym ((SymLabel   nm i):rest)    s = if nm == s then Just $ SymLabel   nm i    else lookup_sym rest s
+lookup_sym ((SymFunName nm i):rest)    s = if nm == s then Just $ SymFunName nm i    else lookup_sym rest s
+
+locals_size :: [Symbol] -> Int
+locals_size ss = sum $ map sz_map ss
+                 where sz_map (SymLocVar _ _ sz) = sz
+                       sz_map _                  = 0
+
+globals_size :: [Symbol] -> Int
+globals_size ss = sum $ map sz_map ss
+                  where sz_map (SymGlobVar _ _ sz) = sz
+                        sz_map _                   = 0
+
+
+init_xlat_state = TranslationState [] [] 0 0 0
 
 keyw_map = fromList [ ("function", KFunction ),
                       ("const",    KConst    ),
@@ -231,30 +252,29 @@ param_size (Para_Lit_S s) = return $ length s + 2
 param_size (Para_Label s) = return 3
 
 param_size (Para_Ident s) = do st <- get
-                               let m_l = lookup s (locals  st)
-                               let m_g = lookup s (globals st)
-                               let m_c = lookup s (consts  st)
-                               case (m_l, m_g, m_c) of
-                                 ((Just l), _, _) -> return $ integer_enc_size l
-                                 (_, (Just g), _) -> return $ integer_enc_size g
-                                 (_, _, (Just c)) -> return $ integer_enc_size c
-                                 otherwise        -> error  $ "Undeclared identifier: " ++ s
+                               case lookup_sym (syms st) s of
+                                 Just (SymGlobVar _ i _) -> return $ integer_enc_size i
+                                 Just (SymLocVar  _ i _) -> return $ integer_enc_size i
+                                 Just (SymConst   _ i  ) -> return $ integer_enc_size i
+                                 Just (SymLabel   _ i  ) -> return 3
+                                 Just (SymFunName _ i  ) -> return $ integer_enc_size i
+                                 Nothing                 -> error  $ "Undeclared identifier: " ++ s
 
 param_enc :: Int -> OpParam -> State TranslationState [Word8]
 param_enc _ (Para_Lit_I i) = return $ integer_enc i
 param_enc _ (Para_Lit_S s) = return $ string_enc s
-param_enc w (Para_Label s) = get >>= (\st -> case (lookup s $ labels st) of
-                                               Just v  -> return $ integer_enc_3 $ v - ((pc st) + w) -- ref to next pc
+param_enc w (Para_Label s) = get >>= (\st -> case lookup_sym (syms st) s of
+                                               Just (SymLabel _ i) -> return $ integer_enc_3 $ i - ((pc st) + w) -- ref to next pc
                                                Nothing -> error  $ "Label not declared: " ++ s)
 
-param_enc _ (Para_Ident s) = do st <- get
-                                case lookup s $ consts st of
-                                   Just c  -> return $ integer_enc c
-                                   Nothing -> case lookup s $ locals st of
-                                                 Just l  -> return $ set_head 0x40 $ integer_enc l
-                                                 Nothing -> case lookup s $ globals st of 
-                                                              Just g  -> return $ set_head 0x60 $ integer_enc g
-                                                              Nothing -> error $ "Unknown identifier: " ++ s
+param_enc w (Para_Ident s) = do st <- get
+                                case lookup_sym (syms st) s of
+                                  Just (SymGlobVar _ i _) -> return $ set_head 0x60 $ integer_enc i
+                                  Just (SymLocVar  _ i _) -> return $ set_head 0x40 $ integer_enc i
+                                  Just (SymConst   _ i  ) -> return $ integer_enc i
+                                  Just (SymLabel   _ i  ) -> return $ integer_enc_3 $ i - ((pc st) + w) -- ref to next pc
+                                  Just (SymFunName _ i  ) -> return $ integer_enc i
+                                  Nothing                 -> error  $ "Undeclared identifier: " ++ s
                              where set_head bits (x:rest) = (bits .|. x):rest
 
 
@@ -270,16 +290,17 @@ xlate_globals ((LabelDecl s):_)      = error $ "Labels are not allowed in global
 xlate_globals ((Operation s pp):_)   = error $ "Instructions are not allowed in global space: " ++ show (Operation s pp)
 
 xlate_globals ((ConstDecl s i):rest) = do st <- get
-                                          put st{consts = (s,i):consts st}
+                                          put st{syms = (SymConst s i):syms st}
                                           xlate_globals rest 
 
 xlate_globals ((VarDecl s i):rest)   = do st <- get
-                                          put st{globals = (s, go st):globals st, go = (go st) + i}
+                                          put st{syms = (SymGlobVar s (go st) i):syms st, go = (go st) + i}
                                           xlate_globals rest 
 
 xlate_flist :: [Function] -> State TranslationState ()
 xlate_flist ff = do st <- get
-                    put st{fnlist = zip (map fname ff) [0..]}
+                    let fnlist = map (\(a,b) -> SymFunName a b) $ zip (map fname ff) [0..]
+                    put st{syms = syms st ++ fnlist}
                     return ()
 
 xlate_func_fst :: [Statement] -> State TranslationState ()
@@ -287,7 +308,7 @@ xlate_func_fst :: [Statement] -> State TranslationState ()
 xlate_func_fst []                      = return ()
 
 xlate_func_fst ((LabelDecl s):rest)    = do st <- get
-                                            put st{labels = (s, pc st):labels st}
+                                            put st{syms = (SymLabel s (pc st)):syms st}
                                             xlate_func_fst rest
 
 xlate_func_fst ((Operation s pp):rest) = do st <- get -- only increment pc on the first pass
@@ -296,11 +317,11 @@ xlate_func_fst ((Operation s pp):rest) = do st <- get -- only increment pc on th
                                             xlate_func_fst rest
 
 xlate_func_fst ((ConstDecl s i):rest)  = do st <- get
-                                            put st{consts = (s,i):consts st}
+                                            put st{syms = (SymConst s i):syms st}
                                             xlate_func_fst rest 
 
 xlate_func_fst ((VarDecl s i):rest)    = do st <- get
-                                            put st{locals = (s, lo st):locals st, lo = (lo st) + i}
+                                            put st{syms = (SymLocVar s (lo st) i):syms st, lo = (lo st) + i}
                                             xlate_func_fst rest
 
 
@@ -325,17 +346,15 @@ serialize_xlt :: TranslationState -> [Word8]
 serialize_xlt st = let img_signature = [0x4c, 0x45, 0x47, 0x4f]
                        version_info  = [0x68, 0x00]
                        num_objects   = [0x01, 0x00]
-                       glob_bytes    = varblock_size $ globals st
+                       glob_bytes    = tail $ integer_enc_5 $ globals_size $ syms st
                        serial_code   = concat $ map (\(_, _, x) -> x) $ reverse $ instns st 
                        image_size    = tail $ integer_enc_5 (16 + 12 + (length serial_code))
                        offst_to_inst = tail $ integer_enc_5 (16 + 12)
                        zeroes        = [0, 0, 0, 0]
-                       loc_bytes     = varblock_size $ locals st
+                       loc_bytes     = tail $ integer_enc_5 $ locals_size $ syms st
                    in  img_signature ++ image_size ++ version_info ++ num_objects ++ glob_bytes ++ 
                        offst_to_inst ++ zeroes ++ loc_bytes ++ 
                        serial_code
-                   where varblock_size []    = [0, 0, 0, 0]
-                         varblock_size (x:_) = tail $ integer_enc_5 $ snd x + 4
 
 write_rbf :: FilePath -> [Word8] -> IO ()
 write_rbf fname code = BS.writeFile fname $ BS.pack $ code
