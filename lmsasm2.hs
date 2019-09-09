@@ -10,13 +10,12 @@ import InstnEncodings
 
 data Token = Comment  String |
              Ident    String |
-             Label    String |
              Instn    String |
              Lit_S    String |
              Lit_I    Int    |
              LParen | RParen |
              LBrace | RBrace |
-             KFunction | KConst | KWord | KHalf | KByte | KString |
+             KFunction | KIn | KOut | KConst | KWord | KHalf | KByte | KString |
              Comma | Semi | Colon | Equal | EOF deriving (Show, Eq);
 
 data Statement = ConstDecl String Int |
@@ -26,8 +25,7 @@ data Statement = ConstDecl String Int |
 
 data OpParam = Para_Lit_I Int    |
                Para_Lit_S String |
-               Para_Ident String |
-               Para_Label String deriving (Show)
+               Para_Ident String deriving (Show)
 
 data Symbol = SymConst   String Int     |
               SymGlobVar String Int Int |
@@ -69,6 +67,8 @@ globals_size ss = sum $ map sz_map ss
 init_xlat_state = TranslationState [] [] 0 0 0
 
 keyw_map = fromList [ ("function", KFunction ),
+                      ("in",       KIn       ),
+                      ("out",      KOut      ),
                       ("const",    KConst    ),
                       ("word",     KWord     ),
                       ("half",     KHalf     ),
@@ -90,7 +90,6 @@ tokenize (';':xs)     = Semi     : tokenize xs
 tokenize (':':xs)     = Colon    : tokenize xs
 tokenize (',':xs)     = Comma    : tokenize xs
 tokenize ('=':xs)     = Equal    : tokenize xs
-tokenize ('@':xs)     = Label   (takeWhile isIdentAlpha xs)                : tokenize (dropWhile isIdentAlpha xs)
 tokenize ('/':'/':xs) = Comment (takeWhile (/= '\n') xs)                   : tokenize (dropWhile (/= '\n') xs)
 tokenize ('"':xs)     = Lit_S   (takeWhile (/= '"')  xs)                   : tokenize (tail (dropWhile (/= '"' ) xs))
 tokenize (x:xs) | isDigit x      = Lit_I (read (takeWhile isDigit (x:xs))) : tokenize (dropWhile isDigit xs)
@@ -124,8 +123,7 @@ take_prm = do (x:rest) <- get
                  (Lit_I i) -> put rest >> return (Para_Lit_I i)
                  (Lit_S i) -> put rest >> return (Para_Lit_S i)
                  (Ident i) -> put rest >> return (Para_Ident i)
-                 (Label i) -> put rest >> return (Para_Label i)
-                 otherwise -> error $ "Expected integer, identifier, string or a label, but got: " ++ show x
+                 otherwise -> error $ "Expected integer, string or identifier, but got: " ++ show x
 
 take_idn :: State [Token] String
 take_idn = do (x:rest) <- get
@@ -249,8 +247,6 @@ op_size (Operation _ params) = (mapM param_size params) >>= (\pm -> return $ sum
 param_size :: OpParam -> State TranslationState Int
 param_size (Para_Lit_I i) = return (integer_enc_size i)
 param_size (Para_Lit_S s) = return $ length s + 2
-param_size (Para_Label s) = return 3
-
 param_size (Para_Ident s) = do st <- get
                                case lookup_sym (syms st) s of
                                  Just (SymGlobVar _ i _) -> return $ integer_enc_size i
@@ -263,10 +259,6 @@ param_size (Para_Ident s) = do st <- get
 param_enc :: Int -> OpParam -> State TranslationState [Word8]
 param_enc _ (Para_Lit_I i) = return $ integer_enc i
 param_enc _ (Para_Lit_S s) = return $ string_enc s
-param_enc w (Para_Label s) = get >>= (\st -> case lookup_sym (syms st) s of
-                                               Just (SymLabel _ i) -> return $ integer_enc_3 $ i - ((pc st) + w) -- ref to next pc
-                                               Nothing -> error  $ "Label not declared: " ++ s)
-
 param_enc w (Para_Ident s) = do st <- get
                                 case lookup_sym (syms st) s of
                                   Just (SymGlobVar _ i _) -> return $ set_head 0x60 $ integer_enc i
