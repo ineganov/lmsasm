@@ -23,6 +23,9 @@ data Statement = ConstDecl String Int |
                  LabelDecl String     |
                  Operation String [OpParam] deriving (Show)
 
+data FuncParam = InParam  String Int |
+                 OutParam String Int deriving (Show)
+
 data OpParam = Para_Lit_I Int    |
                Para_Lit_S String |
                Para_Ident String deriving (Show)
@@ -33,7 +36,7 @@ data Symbol = SymConst   String Int     |
               SymLabel   String Int     |
               SymFunName String Int deriving (Show)
 
-data Function = Function {fname :: String, fcode :: [Statement]} deriving (Show)
+data Function = Function {fname :: String, fpars :: [FuncParam], fcode :: [Statement]} deriving (Show)
 
 data ObjectFile = ObjectFile [Statement] [Function] deriving (Show)
 
@@ -179,10 +182,33 @@ parse_params acc = do p          <- take_prm
 parse_function :: State [Token] Function
 parse_function = do expect KFunction
                     nm <- take_idn
-                    expect LParen >> expect RParen >> expect LBrace
+                    expect LParen
+                    fpars <- parse_func_params []
+                    expect RParen
+                    expect LBrace
                     stmts <- parse_statements []
                     expect RBrace
-                    return $ Function nm stmts
+                    return $ Function nm fpars stmts
+
+parse_func_params :: [FuncParam] -> State [Token] [FuncParam]
+parse_func_params acc = do r <- get
+                           case r of
+                              (RParen:rest) -> return acc
+                              (Comma :rest) -> put rest >> parse_func_param >>= (\pp -> parse_func_params (acc ++ [pp]))
+                              otherwise     -> parse_func_param >>= (\pp -> parse_func_params (acc ++ [pp]))
+
+parse_func_param :: State [Token] FuncParam
+parse_func_param = do r <- get
+                      case r of
+                        (KIn :KByte  :(Ident i):rest) -> put rest >> return (InParam i 1)
+                        (KIn :KHalf  :(Ident i):rest) -> put rest >> return (InParam i 1)
+                        (KIn :KWord  :(Ident i):rest) -> put rest >> return (InParam i 1)
+                        (KIn :KString:(Ident i):rest) -> put rest >> expect Colon >> take_int >>= (\d -> return (InParam i d))
+                        (KOut:KByte  :(Ident i):rest) -> put rest >> return (OutParam i 1)
+                        (KOut:KHalf  :(Ident i):rest) -> put rest >> return (OutParam i 1)
+                        (KOut:KWord  :(Ident i):rest) -> put rest >> return (OutParam i 1)
+                        (KOut:KString:(Ident i):rest) -> put rest >> expect Colon >> take_int >>= (\d -> return (OutParam i d))
+                        otherwise                     -> error $ "Expected function argument declaration, but got: " ++ (show $ take 5 r)
 
 parse_functions :: [Function] -> State [Token] [Function]
 parse_functions acc = do f <- parse_function
@@ -269,6 +295,19 @@ param_enc w (Para_Ident s) = do st <- get
                                   Nothing                 -> error  $ "Undeclared identifier: " ++ s
                              where set_head bits (x:rest) = (bits .|. x):rest
 
+func_params_enc :: [FuncParam] -> [Word8]
+func_params_enc fp = [fromIntegral $ length fp] ++ (concat $ map pmap fp)
+                     where pmap (OutParam _ 1) = [0x40]
+                           pmap (OutParam _ 2) = [0x41]
+                           pmap (OutParam _ 4) = [0x42]
+                        -- pmap (OutParam _ 4) = [0x43] -- FIXME: floating point, add to parser as well
+                           pmap (OutParam _ x) = [0x44, fromIntegral x] -- FIXME: up to 255 byte strings?
+                           pmap (InParam  _ 1) = [0x80]
+                           pmap (InParam  _ 2) = [0x81]
+                           pmap (InParam  _ 4) = [0x82]
+                           pmap (InParam  _ x) = [0x84, fromIntegral x] -- FIXME: up to 255 byte strings?
+
+-----------------------------------------------------------------------------------------------------------------------
 
 reset_pc :: State TranslationState ()
 reset_pc = get >>= (\st -> put st{pc = 0})
@@ -288,6 +327,16 @@ xlate_globals ((ConstDecl s i):rest) = do st <- get
 xlate_globals ((VarDecl s i):rest)   = do st <- get
                                           put st{syms = (SymGlobVar s (go st) i):syms st, go = (go st) + i}
                                           xlate_globals rest 
+
+xlate_func_par :: [FuncParam] -> State TranslationState ()
+
+xlate_func_par [] = return ()
+xlate_func_par ((OutParam s i):rest) = xlate_func_par ((InParam s i):rest)
+xlate_func_par ((InParam  s i):rest) = do st <- get
+                                          put st{syms = (SymLocVar s (lo st) i):syms st, lo = (lo st) + i}
+                                          xlate_func_par rest
+
+
 
 xlate_flist :: [Function] -> State TranslationState ()
 xlate_flist ff = do st <- get
@@ -330,7 +379,12 @@ xlate_func_snd ((Operation s pp):rest) = do st <- get
                                             xlate_func_snd rest
 
 xlate_function :: ObjectFile -> State TranslationState ()
-xlate_function (ObjectFile globs fns) = xlate_globals globs >> xlate_flist fns >> xlate_func_fst (fcode $ head fns) >> reset_pc >> xlate_func_snd (fcode $ head fns)
+xlate_function (ObjectFile globs fns) = xlate_globals globs >>
+                                        xlate_flist fns     >>
+                                        xlate_func_par (fpars $ head fns) >>
+                                        xlate_func_fst (fcode $ head fns) >>
+                                        reset_pc                          >>
+                                        xlate_func_snd (fcode $ head fns)
 
 -----------------------------------------------------------------------------------------------------------------------
 
