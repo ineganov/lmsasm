@@ -1,4 +1,4 @@
-module InstnEncodings (instn_lookup, opcode_map) where
+module InstnEncodings (instn_lookup, opcode_map, is_jump) where
 
 import Data.Map (fromList, lookup, Map)
 import Data.Word
@@ -7,6 +7,10 @@ instn_lookup :: String -> Word8
 instn_lookup s = from_maybe (Data.Map.lookup s opcode_map)
                  where from_maybe (Just val) = val
                        from_maybe  Nothing   = error $ "This instruction is not found: " ++ s
+
+is_jump :: String -> Bool
+is_jump ('j':'r':_) = True
+is_jump _           = False
 
 opcode_map ::Map String Word8
 opcode_map = fromList [ ("error",             0x0),
