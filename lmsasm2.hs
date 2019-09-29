@@ -201,12 +201,12 @@ parse_func_param :: State [Token] FuncParam
 parse_func_param = do r <- get
                       case r of
                         (KIn :KByte  :(Ident i):rest) -> put rest >> return (InParam i 1)
-                        (KIn :KHalf  :(Ident i):rest) -> put rest >> return (InParam i 1)
-                        (KIn :KWord  :(Ident i):rest) -> put rest >> return (InParam i 1)
+                        (KIn :KHalf  :(Ident i):rest) -> put rest >> return (InParam i 2)
+                        (KIn :KWord  :(Ident i):rest) -> put rest >> return (InParam i 4)
                         (KIn :KString:(Ident i):rest) -> put rest >> expect Colon >> take_int >>= (\d -> return (InParam i d))
                         (KOut:KByte  :(Ident i):rest) -> put rest >> return (OutParam i 1)
-                        (KOut:KHalf  :(Ident i):rest) -> put rest >> return (OutParam i 1)
-                        (KOut:KWord  :(Ident i):rest) -> put rest >> return (OutParam i 1)
+                        (KOut:KHalf  :(Ident i):rest) -> put rest >> return (OutParam i 2)
+                        (KOut:KWord  :(Ident i):rest) -> put rest >> return (OutParam i 4)
                         (KOut:KString:(Ident i):rest) -> put rest >> expect Colon >> take_int >>= (\d -> return (OutParam i d))
                         otherwise                     -> error $ "Expected function argument declaration, but got: " ++ (show $ take 5 r)
 
@@ -228,6 +228,8 @@ parse_file_io s = do f <- readFile s
                      return $ evalState parse_file tk
 
 -----------------------------------------------------------------------------------------------------------------------
+getByte :: Int -> Word32 -> Word8
+getByte i v = fromIntegral $ rotateR v (8*i)
 
 integer_enc_size :: Int -> Int
 integer_enc_size i | (i <    32) && (i >    -33) = 1
@@ -243,13 +245,15 @@ integer_enc_2 x = [0x81, fromIntegral x]
 
 integer_enc_3 :: Int -> [Word8]
 integer_enc_3 x = [0x82, getByte 0 w32, getByte 1 w32]
-                  where w32         = (fromIntegral x) :: Word32
-                        getByte i v = fromIntegral $ rotateR v (8*i)
+                  where w32 = fromIntegral x
 
 integer_enc_5 :: Int -> [Word8]
 integer_enc_5 x = [0x83, getByte 0 w32, getByte 1 w32, getByte 2 w32, getByte 3 w32]
-                  where w32         = (fromIntegral x) :: Word32
-                        getByte i v = fromIntegral $ rotateR v (8*i)
+                  where w32 = fromIntegral x
+
+integer_enc_4 :: Int -> [Word8]
+integer_enc_4 x = [getByte 0 w32, getByte 1 w32, getByte 2 w32, getByte 3 w32]
+                  where w32 = fromIntegral x
 
 integer_enc :: Int -> [Word8]
 integer_enc x = case (integer_enc_size x) of
@@ -280,7 +284,7 @@ param_size (Para_Ident s) = do st <- get
                                  Just (SymConst   _ i  ) -> return $ integer_enc_size i
                                  Just (SymLabel   _ i  ) -> return 3
                                  Just (SymFunName _ i  ) -> return $ integer_enc_size i
-                                 Nothing                 -> error  $ "Undeclared identifier: " ++ s
+                                 Nothing                 -> error  $ "Undeclared identifier (param size): " ++ s
 
 param_enc :: Int -> OpParam -> State TranslationState [Word8]
 param_enc _ (Para_Lit_I i) = return $ integer_enc i
@@ -340,7 +344,7 @@ xlate_func_par ((InParam  s i):rest) = do st <- get
 
 xlate_flist :: [Function] -> State TranslationState ()
 xlate_flist ff = do st <- get
-                    let fnlist = map (\(a,b) -> SymFunName a b) $ zip (map fname ff) [0..]
+                    let fnlist = map (\(a,b) -> SymFunName a b) $ zip (map fname ff) [1..] -- functions start at index 1
                     put st{syms = syms st ++ fnlist}
                     return ()
 
@@ -353,8 +357,10 @@ xlate_func_fst ((LabelDecl s):rest)    = do st <- get
                                             xlate_func_fst rest
 
 xlate_func_fst ((Operation s pp):rest) = do st <- get -- only increment pc on the first pass
-                                            par_sizes <- mapM param_size pp
-                                            put st{pc = (pc st) + (sum par_sizes) + 1}
+                                            par_sizes <- if is_jump s then mapM param_size (init pp) -- never lookup jump target symbol
+                                                                      else mapM param_size pp
+                                            if is_jump s then put st{pc = (pc st) + (sum par_sizes) + 4}
+                                                         else put st{pc = (pc st) + (sum par_sizes) + 1}
                                             xlate_func_fst rest
 
 xlate_func_fst ((ConstDecl s i):rest)  = do st <- get
@@ -378,29 +384,41 @@ xlate_func_snd ((Operation s pp):rest) = do st <- get
                                             put st{instns = new_inst:instns st, pc = (pc st) + (sum par_sizes) + 1}
                                             xlate_func_snd rest
 
-xlate_function :: ObjectFile -> State TranslationState ()
-xlate_function (ObjectFile globs fns) = xlate_globals globs >>
-                                        xlate_flist fns     >>
-                                        xlate_func_par (fpars $ head fns) >>
-                                        xlate_func_fst (fcode $ head fns) >>
-                                        reset_pc                          >>
-                                        xlate_func_snd (fcode $ head fns)
+xlate_function :: Function -> State TranslationState ()
+xlate_function fn = xlate_func_par (fpars fn) >> xlate_func_fst (fcode fn) >> reset_pc >> xlate_func_snd (fcode fn)
+
+xlate_obj :: ObjectFile -> ([[Word8]], [TranslationState])
+xlate_obj (ObjectFile globs fns) = let global_state = execState (xlate_globals globs >> xlate_flist fns) init_xlat_state in
+                                       ( (map (\f -> func_params_enc $ fpars f) fns), (map (\f -> execState (xlate_function f) global_state) fns) )
+
 
 -----------------------------------------------------------------------------------------------------------------------
 
-serialize_xlt :: TranslationState -> [Word8]
-serialize_xlt st = let img_signature = [0x4c, 0x45, 0x47, 0x4f]
-                       version_info  = [0x68, 0x00]
-                       num_objects   = [0x01, 0x00]
-                       glob_bytes    = tail $ integer_enc_5 $ globals_size $ syms st
-                       serial_code   = concat $ map (\(_, _, x) -> x) $ reverse $ instns st 
-                       image_size    = tail $ integer_enc_5 (16 + 12 + (length serial_code))
-                       offst_to_inst = tail $ integer_enc_5 (16 + 12)
-                       zeroes        = [0, 0, 0, 0]
-                       loc_bytes     = tail $ integer_enc_5 $ locals_size $ syms st
-                   in  img_signature ++ image_size ++ version_info ++ num_objects ++ glob_bytes ++ 
-                       offst_to_inst ++ zeroes ++ loc_bytes ++ 
-                       serial_code
+serialize_obj_header :: Bool -> Int -> TranslationState -> [Word8]
+serialize_obj_header is_main ofst st = (integer_enc_4 ofst)              ++ 
+                                       [0x00, 0x00, trigger_count, 0x00] ++ 
+                                       (integer_enc_4 $ locals_size $ syms st)
+                                       where trigger_count = if is_main then 0x00 else 0x01
+
+serialize_obj_code :: [Word8] -> TranslationState -> [Word8]
+serialize_obj_code pfx st = pfx ++ (concat $ map (\(_, _, x) -> x) $ reverse $ instns st)
+
+
+serialize_obj :: ([[Word8]], [TranslationState]) -> [Word8]
+serialize_obj (pfxs, sts) = image_header ++ first_header ++ (concat other_headers) ++ (concat code_blocks)
+                            where code_pfxs    = []:(tail pfxs)
+                                  code_blocks  = map (\(pfx, st) -> serialize_obj_code pfx st) (zip code_pfxs sts)
+                                  image_size   = 16 + 12 * (length sts) + (sum $ map length code_blocks)
+                                  code_offsets = scanl (+) (16 + 12 * (length sts)) (init $ map length code_blocks)
+                                  image_header   = img_signature ++ image_size_enc ++ version_info ++ num_objects ++ glob_size
+                                  img_signature  = [0x4c, 0x45, 0x47, 0x4f]
+                                  image_size_enc = integer_enc_4 image_size
+                                  version_info   = [0x68, 0x00]
+                                  num_objects    = [fromIntegral $ length sts, 0x00]
+                                  glob_size      = integer_enc_4 $ globals_size $ syms $ head sts
+                                  first_header   = serialize_obj_header True (head code_offsets) (head sts)
+                                  other_headers  = map (\(ofst, st) -> serialize_obj_header False ofst st) (zip (tail code_offsets) (tail sts))
+
 
 write_rbf :: FilePath -> [Word8] -> IO ()
 write_rbf fname code = BS.writeFile fname $ BS.pack $ code
@@ -410,5 +428,4 @@ write_rbf fname code = BS.writeFile fname $ BS.pack $ code
 main :: IO ()
 main = do fname  <- fmap head getArgs
           parsed <- parse_file_io fname
-          let xlt = execState  (xlate_function parsed) init_xlat_state
-          write_rbf (replaceExtension fname ".rbf") (serialize_xlt xlt)
+          write_rbf (replaceExtension fname ".rbf") (serialize_obj $ xlate_obj parsed)
