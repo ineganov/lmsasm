@@ -1,0 +1,75 @@
+const UI_DRAW_FILLWINDOW = 19;
+const UI_DRAW_VALUE      = 8;
+const UI_DRAW_TEXT       = 5;
+const UI_DRAW_CIRCLE     = 4;
+const UI_DRAW_UPDATE     = 0;
+
+const UI_WAIT_FOR_PRESS  = 3;
+const UI_FLUSH           = 4;
+
+const UI_LEDS            = 27;
+const UI_ORANGE_STABLE   = 3;
+
+const NUMBER_TO_STRING   = 9;
+
+const COLOR_BLACK = 1;
+const COLOR_WHITE = 0;
+
+half result_div;
+   
+function main () { // With a comment
+   
+      string str_a : 16;
+      string str_b : 16;
+
+      word timer_var;
+
+      half p;
+      half q;
+
+      half result_add;
+
+      ui_write UI_LEDS, UI_ORANGE_STABLE;
+
+      ui_draw UI_DRAW_FILLWINDOW, 0, 0, 0;
+      ui_draw UI_DRAW_TEXT, COLOR_BLACK, 10, 20, "Hello there!";
+      ui_draw UI_DRAW_UPDATE;
+
+      move8_16 31, p;
+      move8_16  3, q;
+      move8_16 42, result_div; // Expect this to be overwritten
+
+      call make_add, 3, p, q, result_add;
+      call make_div, 2, p, q;
+
+      strings NUMBER_TO_STRING, result_add, 5, str_a;
+      strings NUMBER_TO_STRING, result_div, 5, str_b;
+
+      ui_draw UI_DRAW_TEXT, COLOR_BLACK, 10, 40, str_a;
+      ui_draw UI_DRAW_TEXT, COLOR_BLACK, 10, 60, str_b;
+      ui_draw UI_DRAW_UPDATE;
+      
+      forever:
+        ui_button UI_WAIT_FOR_PRESS;
+        ui_draw   UI_DRAW_TEXT, COLOR_BLACK, 10, 80, "Pressed!";
+        ui_draw   UI_DRAW_UPDATE;
+        timer_wait  700, timer_var;
+        timer_ready      timer_var;
+        ui_draw   UI_DRAW_TEXT, COLOR_BLACK, 10, 80, "        ";
+        ui_draw   UI_DRAW_UPDATE;
+        ui_button UI_FLUSH;
+        jr forever;
+
+      object_end;
+}
+
+function make_add (in half a, in half b, out half c) {
+   add16 a, b, c;
+   return;
+}
+
+function make_div (in half a, in half b) {
+   div16 a, b, result_div;
+   return;
+   object_end; // Is this needed?
+}
