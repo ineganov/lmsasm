@@ -1,0 +1,66 @@
+const TONE = 1;
+const WAIT_FOR_PRESS = 3;
+
+const UI_DRAW_FILLWINDOW = 19;
+const UI_DRAW_VALUE      = 8;
+const UI_DRAW_TEXT       = 5;
+const UI_DRAW_CIRCLE     = 4;
+const UI_DRAW_UPDATE     = 0;
+
+const NUMBER_TO_STRING   = 9;
+
+const COLOR_BLACK = 1;
+const COLOR_WHITE = 0;
+
+function main() {
+      word timer_var;
+      word mem_total;
+      word mem_free;
+      word mem_total_f;
+      word mem_free_f;
+      word test;
+      word str_a;
+      word str_b;
+      word str_c;
+      byte cnt;
+      
+      ui_draw UI_DRAW_FILLWINDOW, 0, 0, 0;
+      ui_draw UI_DRAW_TEXT, COLOR_BLACK, 10, 50, "Hello!";
+
+      move8_8   20, cnt;
+      move8_32   0, timer_var;
+
+      ui_write 8, "hallo";
+      ui_write 1;
+
+      memory_usage mem_total, mem_free;
+
+      move32_f mem_total, mem_total_f;
+      move32_f mem_free,  mem_free_f;
+      move32_32 1000000, test;
+      move32_f  test, test;
+
+      // strings NUMBER_TO_STRING, mem_total, 10, str_a;
+      // ui_draw UI_DRAW_TEXT, COLOR_BLACK,   10, 80, str_a;
+
+      // strings NUMBER_TO_STRING, mem_free, 10, str_a;
+      // ui_draw UI_DRAW_TEXT, COLOR_BLACK,  10, 90, str_a;
+
+      ui_draw UI_DRAW_VALUE, COLOR_BLACK, 10, 80, mem_total_f, 10, 5;
+      ui_draw UI_DRAW_VALUE, COLOR_BLACK, 10, 90, mem_free_f,  10, 5;
+      ui_draw UI_DRAW_VALUE, COLOR_BLACK, 10, 100, test,  10, 8;
+
+      ui_draw UI_DRAW_UPDATE;
+
+
+   loop:
+      ui_draw UI_DRAW_CIRCLE, COLOR_BLACK, cnt, 40, 10;
+      ui_draw UI_DRAW_UPDATE;
+
+      timer_wait 700, timer_var;
+      timer_ready timer_var;
+      add8 10, cnt, cnt;
+      jr_neq8 70, cnt, loop;
+
+      object_end;
+}
